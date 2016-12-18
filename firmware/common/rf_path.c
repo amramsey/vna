@@ -1,11 +1,20 @@
 #include <libopencm3/lpc43xx/gpio.h>
 #include <libopencm3/lpc43xx/scu.h>
 #include <libopencm3/lpc43xx/ssp.h>
+#include <libopencm3/lpc43xx/ritimer.h>
 #include "hackrf_core.h"
 #include "adchs.h"
+#include "sgpio.h"
+
+#define ENABLE_RITIMER() (RITIMER_CTRL =  (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3))
+#define DISABLE_RITIMER() (RITIMER_CTRL =  (1 << 0) | (1 << 1) | (1 << 2) | (0 << 3))
+
+static volatile uint8_t isr_done;
+static uint32_t *isr_delays;
+static uint32_t isr_channels;
+static uint32_t isr_count;
 
 static void spi_write_register(uint32_t data);
-
 static uint32_t spi_read_register(void);
 
 void enable_pa(void) {
@@ -124,17 +133,16 @@ void source_write_register(uint32_t data) {
     gpio_set(PORT_SOURCE_LE, PIN_SOURCE_LE);
 }
 
-void wait_for_source_lock() {
-    while (gpio_get(PORT_SOURCE_LD, PIN_SOURCE_LD ));
-}
-
-void wait_for_lo_lock() {
-    while (gpio_get(PORT_LO_LD, PIN_LO_LD ));
-}
-
 void wait_for_lock() {
     //Assumes that PORT_SOURCE_LD == PORT_LO_LD
-    while (gpio_get(PORT_SOURCE_LD, PIN_SOURCE_LD | PIN_LO_LD) == (PIN_SOURCE_LD | PIN_LO_LD));
+    int i = 0;
+    while ( i < 1000) {
+        if (!gpio_get(PORT_SOURCE_LD, PIN_SOURCE_LD | PIN_LO_LD)) {
+            i = 0;
+        } else {
+            i++;
+        }
+    };
 }
 
 /* FIXME: Send only 8 bits */
@@ -149,44 +157,31 @@ void att_write_register(uint8_t data) {
     gpio_clear(PORT_ATT_LE, PIN_ATT_LE);
 }
 
-void sample(uint32_t ports) {
-#define CH_DELAY 41000/5
+void ritimer_isr(void) {
+    ENABLE_RITIMER(); //Clear interrupt
+    if ( ((isr_channels & 0x0F) == 0x0F) || isr_count >= 4 ) {
+        DISABLE_RITIMER();
+        isr_done = 1;
+    } else {
+        set_rx_channel(isr_channels & 0x0F);
+        isr_channels = isr_channels >> 4;
+        RITIMER_COMPVAL = isr_delays[isr_count++];
+    }
+}
 
-    if (ports == 1) {
-        set_rx_channel(0);
-        wait_for_lock();
-        delay(1000);
-        ADCHS_restart_dma();
-        delay(2*CH_DELAY);
-        set_rx_channel(2);
-        delay(2*CH_DELAY);
-    }
-    if (ports == 2) {
-        set_rx_channel(1);
-        wait_for_lock();
-        delay(1000);
-        ADCHS_restart_dma();
-        delay(2*CH_DELAY);
-        set_rx_channel(3);
-        delay(2*CH_DELAY);
-    }
-    if (ports == 3) {
-        // 2000 samples/channel. 104 MHz system clock rate, 9.6 MHz ADC clock.
-        set_rx_channel(0);
-        wait_for_lock();
-        //Switch settling time 50us
-        delay(1000);
-        ADCHS_restart_dma();
-        delay(CH_DELAY);
-        set_rx_channel(1);
-        delay(CH_DELAY);
-        set_rx_channel(2);
-        delay(CH_DELAY);
-        set_rx_channel(3);
-    // FIXME
-#if 1
-        delay(CH_DELAY);
-        set_rx_channel(0);
-#endif
+void sample(uint32_t channels, uint32_t *delays) {
+    isr_count = 0;
+    isr_done = 0;
+    RITIMER_COMPVAL = delays[0];
+    set_rx_channel( (channels & 0x0F) );
+    isr_channels = channels >> 4;
+    isr_delays = &delays[1];
+
+    wait_for_lock();
+    ADCHS_restart_dma();
+    RITIMER_COUNTER = 0;
+    ENABLE_RITIMER();
+    while(isr_done == 0) {
+        fill_rng();
     }
 }

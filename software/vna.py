@@ -5,9 +5,10 @@ import time
 import lmh2110_cal
 import numpy as np
 import skrf
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, sosfilt, sosfilt_zi
 import pickle
 import matplotlib.pyplot as plt
+from scipy import stats
 
 class DummyDevice():
     def ctrl_transfer(self, bmRequestType, bRequest, wValue=0, wIndex=0,
@@ -21,14 +22,14 @@ class MAX2871():
         self.register_def = {
                 0:{'int':(31, 1), 'n':(15, 16), 'frac':(3, 12)},
                 1:{'reserved0':(31, 1), 'cpl':(29, 2), 'cpt': (27, 2), 'p':(15,12), 'm':(3,12)},
-                2:{'lds':(31,1), 'sdn':(29,2), 'mux':(26,3), 'dbr':(25,1), 'rdiv2':(24,1), 'r':(14,9),
+                2:{'lds':(31,1), 'sdn':(29,2), 'mux':(26,3), 'dbr':(25,1), 'rdiv2':(24,1), 'r':(14,10),
                     'reg4db':(13,1), 'cp':(9,4), 'ldf':(8,1), 'ldp':(7,1), 'pdp':(6,1), 'shdn':(5,1),
                     'tri':(4,1), 'rst':(3,1)},
-                3:{'vco':(26,5), 'vas_shdn':(25,1), 'vas_temp':(24,1), 'reserved1':(19,5), 'csm':(18,1),
+                3:{'vco':(26,6), 'vas_shdn':(25,1), 'vas_temp':(24,1), 'reserved1':(19,5), 'csm':(18,1),
                     'mutedel':(17,1), 'cdm':(15,2), 'cdiv':(3,12)},
                 4:{'reserved2':(29,3), 'sdldo':(28,1), 'sddiv':(27,1), 'sdref':(26,1), 'bs_msb':(24,2),
                     'fb':(23,1), 'diva':(20,3), 'bs_lsb':(12,8), 'sdvco':(11,1), 'mtld':(10,1),
-                    'bdiv':(9,1), 'bpwr':(6,2), 'rfa_en':(5,1), 'apwr':(3,2)},
+                    'bdiv':(9,1), 'rfb_en':(8,1), 'bpwr':(6,2), 'rfa_en':(5,1), 'apwr':(3,2)},
                 5:{'reserved3':(31,1), 'vas_dly':(29,2), 'reserved4':(26,3), 'sdlo_pll':(25,1),
                     'f01':(24,1), 'ld':(22,2), 'reserved5':(19,3), 'mux3':(18,1), 'reserved6':(7,11),
                     'adcs':(6,1), 'adcm':(3,3)},
@@ -126,6 +127,9 @@ class MAX2871():
             x = Fraction((fvco-d*fpd*n)/(d*fpd)).limit_denominator(4095)
             f = x.numerator
             m = x.denominator
+            if f == 1 and m == 1:
+                f = 4094
+                m = 4095
         else:
             #Fixed modulus
             f = int(round(m*(fvco-d*fpd*n)/(d*fpd)))
@@ -136,7 +140,7 @@ class MAX2871():
                 #TODO: Set integer mode
                 m = 2
             else:
-                raise ValueError("Invalid M value {}. 2 <= M <= 4095".format(m))
+                raise ValueError("Invalid M value {}. 2 <= M <= 4095. f = {}".format(m, f))
         self.write_value(m=m)
         self.write_value(frac=f)
 
@@ -202,7 +206,7 @@ class MAX2871():
 
 
 class VNA():
-    def __init__(self, lo2_freq=2e6, output_power=0, averages=1, dummy=False):
+    def __init__(self, lo2_freq=2e6, output_power=0, averages=1, averages_at_low_f=None, dummy=False):
 
         if dummy:
             self.device = DummyDevice()
@@ -215,8 +219,18 @@ class VNA():
 
         self.sources_set = False
 
+        #Threshold for extra averaging at low frequencies
+        self.low_f = 400e6
+        if averages_at_low_f == None:
+            self.averages_at_low_f = averages
+        else:
+            self.averages_at_low_f = averages_at_low_f
         #PLL reference frequency
         self.ref_freq = 19.2e6
+        #Microcontroller clock frequency
+        self.mcu_clock = 120e6
+        #Time to switch the receiver SP4T switch
+        self.sp4t_sw_t = 15e-6
         #Mixer output frequency and digital IQ mixing frequency
         self.lo2_freq = lo2_freq
         #ADC sampling frequency
@@ -315,14 +329,9 @@ class VNA():
             raise ValueError("Invalid port name {}. Valid names: {}".format(p, choices.keys()))
         self.device.ctrl_transfer(0x40, 7, i, 0)
 
-    def i_to_ch(self, i, ports):
-        """Baseband signal index to channel name"""
-        if ports == [1,2]:
-            return ['rx2','a','b','rx1'][i]
-        if ports == [1]:
-            return ['rx1','a'][i]
-        if ports == [2]:
-            return ['rx2','b'][i]
+    def i_to_ch(self, i):
+        """Receiver SP4T switch control signal to channel number"""
+        return ['rx1','rx2','a','b'][i]
 
     def assemble_samples(self, x):
         y = []
@@ -338,12 +347,24 @@ class VNA():
         nyq = 0.5 * self.fsample
         low = lowcut / nyq
         high = highcut / nyq
-        sos = butter(order, [low, high], btype='bandpass', analog=False, output='sos')
+        sos = butter(order, [low, high], btype='bandpass', output='sos')
         return sos
 
     def butter_bandpass_filter(self, data, lowcut, highcut, order=5):
         sos = self.butter_bandpass(lowcut, highcut, order=order)
         y = sosfilt(sos, data)
+        return y
+
+    def butter_lowpass(self, highcut, order=5):
+        nyq = 0.5 * self.fsample
+        high = highcut / nyq
+        sos = butter(order, high, btype='lowpass', output='sos')
+        return sos
+
+    def butter_lowpass_filter(self, data, highcut, order=5, init=0):
+        sos = self.butter_lowpass(highcut, order=order)
+        zi = sosfilt_zi(sos)
+        y = sosfilt(sos, data, zi=init*zi)[0]
         return y
 
     def set_output_power(self, freq, power):
@@ -355,16 +376,64 @@ class VNA():
             att = 0
         self.write_att(att)
 
-    def sample(self, ports):
-        if ports == [1]:
-            self.device.ctrl_transfer(0x40, 20, 0, 1)
-        if ports == [2]:
-            self.device.ctrl_transfer(0x40, 20, 0, 2)
-        if ports == [1,2]:
-            self.device.ctrl_transfer(0x40, 20, 0, 3)
+    def sample(self, ports, source_port, all_channels=None):
 
-    def measure_iq(self, freqs, ports=[1,2]):
+        def ch_to_i(x):
+            return {'rx1': 0, 'a': 2, 'rx2': 1, 'b': 3}[x]
+
+        samples = 16384
+
+        if all_channels == False and ports == [1, 2]:
+            if source_port == 1:
+                channels = map(ch_to_i, ['rx1', 'a', 'b'])
+            else:
+                channels = map(ch_to_i, ['rx2', 'a', 'b'])
+        else:
+            if ports == [1]:
+                channels = map(ch_to_i, ['rx1', 'a'])
+            if ports == [2]:
+                channels = map(ch_to_i, ['rx2', 'b'])
+            if ports == [1, 2]:
+                if source_port == 1:
+                    channels = map(ch_to_i, ['rx1', 'a', 'b', 'rx2'])
+                else:
+                    channels = map(ch_to_i, ['rx1', 'a', 'b', 'rx2'])
+
+        #Equal delay = MCU clock*(samples/f_fsample)/channels)
+        delays = [int(self.mcu_clock*(samples/self.fsample)/len(channels))]*len(channels)
+
+        switch = [int(d*self.fsample/self.mcu_clock) for d in delays]
+        switch = np.cumsum(switch)
+
+        samples_delays1 = [0]
+        samples_delays2 = []
+        for s in switch[:-1]:
+            samples_delays2.append(s)
+            samples_delays1.append(s + int(self.sp4t_sw_t*self.fsample))
+        samples_delays2.append(samples)
+
+        sample_delays = zip(samples_delays1, samples_delays2)
+
+        delays8 = []
+        for d in delays:
+            delays8.append((d >> 0*8) & 0xFF)
+            delays8.append((d >> 1*8) & 0xFF)
+            delays8.append((d >> 2*8) & 0xFF)
+            delays8.append((d >> 3*8) & 0xFF)
+
+        channel_word = 0x0F
+
+        for ch in channels[::-1]:
+            channel_word = (channel_word << 4) | ch
+        channel_word = channel_word & (2**32 -1)
+
+        self.device.ctrl_transfer(0x40, 20, channel_word >> 16, channel_word & 0xFFFF, ''.join(map(chr, delays8)))
+
+        return map(self.i_to_ch, channels), sample_delays
+
+    def measure_iq(self, freqs, ports=[1,2], all_channels=True):
         iqs = []
+
         for port in ports:
             self.select_port(port)
             for e,freq in enumerate(freqs):
@@ -384,33 +453,89 @@ class VNA():
                     self.program_sources()
                     self.sources_set = True
 
-                for a in xrange(self.averages):
-                    self.sample(ports)
+                if freq < self.low_f:
+                    averages = self.averages_at_low_f
+                else:
+                    averages = self.averages
+
+                #Wait for PLLs to lock
+                #Hardware lock output doesn't seem to be accurate enough
+                time.sleep(0.5e-3)
+
+                for a in xrange(averages):
+
+                    channels, delays = self.sample(ports, port, all_channels)
 
                     data = self.device.read(0x81, 32768)
                     y = np.array(self.assemble_samples(data))
-                    t = np.linspace(0,len(y)/self.fsample, len(y))
+                    t = np.linspace(0,(len(y)-1)/self.fsample, len(y))
+
+                    #f = [self.fsample*i/(len(y)) for i in xrange(len(y)//2+1)]
+                    #w = np.hanning(len(y))
+                    #plt.plot(f, 20*np.log10(1.0/2**10*1.0/len(y)*np.abs(np.fft.rfft(w*y))))
+                    #plt.figure()
+                    #plt.plot(y)
+                    #plt.show()
+
+                    lo_i = np.cos(-2*np.pi*lo2_f*t)
+                    lo_q = np.sin(-2*np.pi*lo2_f*t)
 
                     #Digital IQ mixing
-
-                    for i in xrange(2*len(ports)):
-                        if ports == [1,2]:
-                            s_start, s_end = [(0,3785), (3850,7740), (7830,11650), (11766, len(y))][i]
-                        else:
-                            s_start, s_end = [(0,3814), (3871, len(y))][i]
-                        ts = t[s_start:s_end]
-                        lo_i = np.cos(-2*np.pi*lo2_f*ts)
-                        lo_q = np.sin(-2*np.pi*lo2_f*ts)
+                    for i in xrange(len(delays)):
+                        s_start, s_end = delays[i]
                         x = y[s_start:s_end]
                         x = x-np.mean(x) #Subtract DC
-                        iq = np.mean(lo_i*x+1j*np.mean(lo_q*x))
-                        if a == 0:
-                            iqs[e][(self.i_to_ch(i, ports),port)] = [iq]
-                        else:
-                            iqs[e][(self.i_to_ch(i, ports),port)].append(iq)
 
-                if len(ports) == 2:
-                    print map(lambda x: 20*np.log10(np.abs(x)), [iqs[e][('rx1',port)], iqs[e][('rx2',port)], iqs[e][('a',port)], iqs[e][('b',port)]])
+                        #x = self.butter_bandpass_filter(x, 0.8*self.lo2_freq, 1.1*self.lo2_freq, order=5)
+                        #f = [self.fsample*j/(len(x)) for j in xrange(len(x)//2+1)]
+                        #w = np.hanning(len(x))
+                        #plt.plot(f, 20*np.log10(1.0/2**10*1.0/len(y)*np.abs(np.fft.rfft(w*x))))
+                        #plt.plot(x)
+                        #plt.show()
+
+                        iqr = (lo_i[s_start:s_end])*x
+                        iqi = (lo_q[s_start:s_end])*x
+
+                        iqr = self.butter_lowpass_filter(iqr, 0.5e6, order=2, init=np.mean(iqr))
+                        iqi = self.butter_lowpass_filter(iqi, 0.5e6, order=2, init=np.mean(iqi))
+
+                        iq = iqr+1j*iqi
+
+                        #plt.figure()
+                        #plt.plot(np.real(iq))
+                        #plt.plot(np.imag(iq))
+                        #plt.show()
+
+                        #plt.figure()
+                        #plt.plot(np.cumsum(np.real(iq))/range(len(iq)))
+                        #plt.plot(np.cumsum(np.imag(iq))/range(len(iq)))
+                        #plt.show()
+
+                        iq = np.mean(iq)
+
+                        if a == 0:
+                            iqs[e][(channels[i],port)] = [iq]
+                        else:
+                            iqs[e][(channels[i],port)].append(iq)
+
+                if port == 1:
+                    norm = np.angle(iqs[e][('rx1',1)])
+                else:
+                    norm = np.angle(iqs[e][('rx2',2)])
+
+                chs = [k for k in iqs[e].keys() if k[1] == port]
+                for ch in chs:
+                    z = 0
+                    for j, a in enumerate(iqs[e][ch]):
+                        z += a*np.exp(-1j*norm[j])
+                    iqs[e][ch] = z/len(iqs[e][ch])
+
+                meas = [iqs[e][k] for k in chs]
+                chs, meas = zip(*sorted(zip(chs, meas)))
+                for i in xrange(len(chs)):
+                    print '{} {}: {:5.1f} {:6.1f}'.format(port, chs[i][0], 20*np.log10(np.abs(meas[i])), np.angle(meas[i])*180/np.pi) ,
+                print
+
         return iqs
 
     def iq_to_sparam(self, iqs, freqs):
@@ -420,39 +545,30 @@ class VNA():
         else:
             ports = [1,2]
 
-        k = iqs[0].keys()[0]
-        averages = len(iqs[0][k])
 
         if len(ports) == 1:
             for f in xrange(len(freqs)):
-                s = []
-                for a in xrange(averages):
-                    if ports[0] == 1:
-                        s.append(
-                                iqs[f][('a',1)][a]/iqs[f][('rx1',1)][a]
-                                )
-                    else:
-                        s.append(
-                                iqs[f][('b',2)][a]/iqs[f][('rx2',2)][a]
-                                )
-                sparams.append(np.mean(s))
+                if ports[0] == 1:
+                    s = iqs[f][('a',1)]/iqs[f][('rx1',1)]
+                else:
+                    s = iqs[f][('b',2)]/iqs[f][('rx2',2)]
+                sparams.append(s)
         elif len(ports) == 2:
             for f in xrange(len(freqs)):
                 s11 = []
                 s12 = []
                 s21 = []
                 s22 = []
-                for a in xrange(averages):
-                    #Switch correction
-                    D = 1.0 - (iqs[f][('rx2',1)][a]/iqs[f][('rx1',1)][a])*(iqs[f][('rx1',2)][a]/iqs[f][('rx2',2)][a])
-                    sm11 = (1.0/D)*( iqs[f][('a',1)][a]/iqs[f][('rx1',1)][a] - (iqs[f][('a',2)][a]/iqs[f][('rx2',2)][a])*(iqs[f][('rx2',1)][a]/iqs[f][('rx1',1)][a]) )
-                    sm12 = (1.0/D)*( iqs[f][('a',2)][a]/iqs[f][('rx2',2)][a] - (iqs[f][('a',1)][a]/iqs[f][('rx1',1)][a])*(iqs[f][('rx1',2)][a]/iqs[f][('rx2',2)][a]) )
-                    sm21 = (1.0/D)*( iqs[f][('b',1)][a]/iqs[f][('rx1',1)][a] - (iqs[f][('b',2)][a]/iqs[f][('rx2',2)][a])*(iqs[f][('rx2',1)][a]/iqs[f][('rx1',1)][a]) )
-                    sm22 = (1.0/D)*( iqs[f][('b',2)][a]/iqs[f][('rx2',2)][a] - (iqs[f][('b',1)][a]/iqs[f][('rx1',1)][a])*(iqs[f][('rx1',2)][a]/iqs[f][('rx2',2)][a]) )
-                    s11.append(sm11)
-                    s12.append(sm12)
-                    s21.append(sm21)
-                    s22.append(sm22)
+                #Switch correction
+                D = 1.0 - (iqs[f][('rx2',1)]/iqs[f][('rx1',1)])*(iqs[f][('rx1',2)]/iqs[f][('rx2',2)])
+                sm11 = (1.0/D)*( iqs[f][('a',1)]/iqs[f][('rx1',1)] - (iqs[f][('a',2)]/iqs[f][('rx2',2)])*(iqs[f][('rx2',1)]/iqs[f][('rx1',1)]) )
+                sm12 = (1.0/D)*( iqs[f][('a',2)]/iqs[f][('rx2',2)] - (iqs[f][('a',1)]/iqs[f][('rx1',1)])*(iqs[f][('rx1',2)]/iqs[f][('rx2',2)]) )
+                sm21 = (1.0/D)*( iqs[f][('b',1)]/iqs[f][('rx1',1)] - (iqs[f][('b',2)]/iqs[f][('rx2',2)])*(iqs[f][('rx2',1)]/iqs[f][('rx1',1)]) )
+                sm22 = (1.0/D)*( iqs[f][('b',2)]/iqs[f][('rx2',2)] - (iqs[f][('b',1)]/iqs[f][('rx1',1)])*(iqs[f][('rx1',2)]/iqs[f][('rx2',2)]) )
+                s11.append(sm11)
+                s12.append(sm12)
+                s21.append(sm21)
+                s22.append(sm22)
                 sparams.append( [[np.mean(s11), np.mean(s12)], [np.mean(s21), np.mean(s22)]] )
 
         return skrf.Network(s=sparams, f=freqs, f_unit='Hz')
@@ -463,11 +579,11 @@ class VNA():
 
 if __name__ == "__main__":
 
-    vna = VNA(lo2_freq=2e6, output_power=0, averages=4, dummy=False)
-    freqs = np.linspace(30e6, 6.0e9, 200)
+    vna = VNA(lo2_freq=2e6, output_power=-5, averages=1, averages_at_low_f=1)
+    freqs = np.linspace(26e6, 6.2e9, 400)
     ports = [1, 2]
 
-    iqs = vna.measure_iq(freqs, ports)
+    iqs = vna.measure_iq(freqs, ports, True)
     pickle.dump((freqs,iqs), open('iqs', 'w'))
     net = vna.iq_to_sparam(iqs, freqs)
 

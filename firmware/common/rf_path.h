@@ -23,9 +23,7 @@ void source_write_register(uint32_t data);
 void att_write_register(uint8_t data);
 
 void wait_for_lock();
-void wait_for_source_lock();
-void wait_for_lo_lock();
 
-void sample(uint32_t ports);
+void sample(uint32_t channels, uint32_t *delays);
 
 #endif
